@@ -1,91 +1,183 @@
 import pydivert
+import time
+from prettytable import PrettyTable
 
-# This list stores the blocked IP Addresses we detect, and we drop data from coming from those addresses
+# Global Variables
+
+# This list stores the blocked IP Addresses we detect, and we drop data from those addresses
 blocked_networks = []
 
-# This dict stores counters of how many packets each address has sent in the past 20 packets received by the localhost
+# This dict stores counters of how many packets each address has sent in the past 50 packets received by the localhost
 dos_stats = {}
 
 # This list stores the previous 50 packets received by the localhost.
-dos_packets_history = []
+packets_history = []
+
+# This float stores the time it took the last 50 packets to be received on the localhost
+sum_time_delta = 0
+
+# This float stores the time the previous packet was received at
+last_packet_recv_time = 0
+
+
+class PotentialAttacker:
+    """
+    The PotentialAttacker class is used to store information regarding the data packets source machines flowing through
+    """
+
+    def __init__(self, ip_address=''):
+        self.ip_address = ip_address
+        self.packets_sent = 1
+        self.last_packet_from_host_time = time.time()
+        self.time_since_own_packet = 0
+        self.time_since_global_packet = 0
+
+    def __str__(self):
+        # Create a PrettyTable object
+        table = PrettyTable()
+        table.field_names = ["Attribute", "Value"]
+
+        # Add rows to the table
+        table.add_row(["IP Address", self.ip_address])
+        table.add_row(["Packets Sent", self.packets_sent])
+        table.add_row(["Time Since Last Packet", self.time_since_own_packet])
+
+        # Return the string representation of the table
+        return str(table)
+
+
+def initiate_win_divert():
+    """
+    The function is responsible for initiating the packet inspection process using WinDivert
+    :return: WinDivert Object
+    """
+    # Init WinDivert Object
+    win_divert = pydivert.WinDivert()
+
+    # We start diverting packets to our WinDivert instance
+    win_divert.open()
+
+    # We return the WinDivert object
+    return win_divert
 
 
 # Main function
 def main():
-    # Init WinDivert Object
-    windi = pydivert.WinDivert()
-
-    # We start diverting packets to our WinDivert instance
-    windi.open()
+    """
+    The function is responsible for the firewall main action which is to inspect each packet and drop it if needed
+    :return: None
+    """
+    # Initiating the packet inspection process
+    win_divert = initiate_win_divert()
 
     while True:
         # Current packet read by the WinDivert
-        p = windi.recv()
+        p = win_divert.recv()
 
-        p_src_addr = None
+        # We extract the source address from the IPV4/IPV6 Header
+        try:
+            if p.ipv4 is None:
+                packet_source_address = p.ipv6.src_addr
+            else:
+                packet_source_address = p.ipv4.src_addr
 
-        # If the p.direction is 1, it means the packet were received from the outer internet to localhost
-        if p.direction == 1:
-            # We extract the source address from the IPV4/IPV6 Header
-            try:
-                if p.ipv4 is None:
-                    p_src_addr = p.ipv6.src_addr
-                else:
-                    p_src_addr = p.ipv4.src_addr
-
-            # If no header, the packet is corrupted/modified and we drop it
-            except AttributeError as e:
-                print(f'Packet has no header, dropping packet')
+            # For each packet, we check if it comes from a blocked address. If so - we drop the packet.
+            if packet_source_address in blocked_networks:
+                print(f'Received packet from {packet_source_address} which is blocked, dropping packet')
                 continue
 
-            # We check for DOS behaviour of the packet and the sender
-            sender_is_suspicious = check_dos_behaviour(p, p_src_addr)
-
-            # If suspicious, we mark the address as blocked
-            if sender_is_suspicious:
-                blocked_networks.append(p_src_addr)
-
-        # For each packet, we check if it comes from a blocked address. If so - we drop the packet.
-        if p_src_addr in blocked_networks and p.direction == 1:
+        # If no IP header, the packet is corrupted/modified and we drop it
+        except AttributeError:
+            print(f'Packet has no header, dropping packet')
             continue
 
-        # If we reached here, it means the packet seems OK and we let it continue
-        windi.send(p)
+        # If the p.direction is 1, it means the packet were received from the outer internet to localhost
+        is_incoming_packet = p.direction == 1
+
+        if is_incoming_packet:
+
+            # We check for DOS behaviour of the packet and the sender
+            sender_is_suspicious = check_dos_behaviour(packet_source_address)
+
+            # If suspicious, we mark the address as blocked and drop the packet
+            if sender_is_suspicious:
+                blocked_networks.append(packet_source_address)
+                continue
+
+        # If we have reached here, it means the packet seems OK and we let it continue its journey
+        win_divert.send(p)
 
 
-# This function checks for DOS patterns in the packets flow
-def check_dos_behaviour(p, p_src_addr):
+def check_dos_behaviour(packet_source_address):
+    """
+    The function is responsible for detecting DOS patterns and alerting the packet inspection process
+    :param packet_source_address:
+    :return: Boolean
+    """
+    global sum_time_delta
+    global last_packet_recv_time
+
+    # If it is the first package inspected, we store the current time as the last packet receive time
+    if last_packet_recv_time == 0:
+        last_packet_recv_time = time.time()
+    else:
+        # If it is not the first packet, we add the time since the last packet to the total time.
+        # The total time represents the time it took all the packets received until now to be received.
+        sum_time_delta += time.time() - last_packet_recv_time
+
+        # We update the last packet receive time to the current packet
+        last_packet_recv_time = time.time()
+
     try:
         # If the address is already in the dos_stats object - it means we already encountered it
-        if p_src_addr in dos_stats:
-            # If so - we increment the counter by one
-            dos_stats[p_src_addr] += 1
+        if packet_source_address in dos_stats:
+            # If so - we increment the packet counter by one
+            dos_stats[packet_source_address].packets_sent += 1
+
+            # We update the time since we got a packet from the same address
+            dos_stats[packet_source_address].time_since_own_packet = time.time() - dos_stats[
+                packet_source_address].last_packet_from_host_time
+
+            # We update the time since we got a packet from any address
+            dos_stats[packet_source_address].time_since_global_packet = time.time() - last_packet_recv_time
+
+            # We update the time of the recent packet we got from the host (which is the current packet)
+            dos_stats[packet_source_address].last_packet_from_host_time = time.time()
+
         else:
-            # If it is the first time we encounter data from this address, we initiate a counter
-            dos_stats[p_src_addr] = 1
+            # If it is the first time we encounter data from this address, we initiate a PotentialAttacker Object
+            dos_stats[packet_source_address] = PotentialAttacker(packet_source_address)
 
-        # We also push the address to the dos_packets_history
-        dos_packets_history.append(p_src_addr)
+        # We also push the address to the packets history list
+        packets_history.append(dos_stats[packet_source_address])
 
-        # If the dos_packets_history has more than 50 packets, we need to get rid of the oldest one
-        if len(dos_packets_history) > 50:
+        # If the packets_history has more than 50 packets, we need to get rid of the oldest one
+        if len(packets_history) > 50:
 
-            # If the address's counter is bigger than 1, we decrement the counter by 1
-            if dos_stats[dos_packets_history[0]] > 1:
-                dos_stats[dos_packets_history[0]] -= 1
+            # If the PotentialAttacker's packet counter is bigger than 1, we decrement the counter by 1
+            if packets_history[0].packets_sent > 1:
+                packets_history[0].packets_sent -= 1
 
-            # If the address's counter is 1, that means we need to remove it completely
+            # If the PotentialAttacker's packet counter is 1, that means we need to remove it completely
             else:
-                dos_stats.pop(dos_packets_history[0])
+                dos_stats.pop(packets_history[0].ip_address)
+
+            # We subtract the time since global packet to keep the average time delta updated
+            sum_time_delta -= packets_history[0].time_since_global_packet
+
             # Of course, we discard the first element in the list (which is the oldest packet)
-            dos_packets_history.pop(0)
+            packets_history.pop(0)
+
         """
-        In anytime, if some address has sent over 60% of packets in the last 50 packets,
-        We assume it might be DOSing. In that case, the function will return True. If not, it returns False.
+        In anytime, if some address has sent over 60% of packets in the last 50 packets, and the time intervals between packets
+        is very fast,  it might be DOSing. In that case, the function will return True. If not, it returns False.
         """
-        print(dos_stats)
-        if dos_stats[p_src_addr] >= 30:
-            print(f"{p_src_addr} is probably DOSing, dropping packet")
+
+        if dos_stats[packet_source_address].packets_sent >= 30 and dos_stats[
+            packet_source_address].time_since_own_packet * 2 <= sum_time_delta / len(packets_history):
+            print(dos_stats[packet_source_address])
+            print(f'Average time between packets {sum_time_delta / len(packets_history)}')
+            print(f"{packet_source_address} is probably DOSing, blocking address...")
             return True
         return False
     except AttributeError as e:
