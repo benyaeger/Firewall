@@ -1,0 +1,2 @@
+prettytable==3.10.0
+pydivert==2.1.0

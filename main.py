@@ -1,3 +1,5 @@
+import random
+
 import pydivert
 import time
 from prettytable import PrettyTable
@@ -18,6 +20,9 @@ sum_time_delta = 0
 
 # This float stores the time the previous packet was received at
 last_packet_recv_time = 0
+
+# This float stores the average time between packets that is randomly checked for DDOS detection
+random_time_interval = 0
 
 
 class PotentialAttacker:
@@ -103,7 +108,6 @@ def main():
             if sender_is_suspicious:
                 blocked_networks.append(packet_source_address)
                 continue
-
         # If we have reached here, it means the packet seems OK and we let it continue its journey
         win_divert.send(p)
 
@@ -116,6 +120,7 @@ def check_dos_behaviour(packet_source_address):
     """
     global sum_time_delta
     global last_packet_recv_time
+    global random_time_interval
 
     # If it is the first package inspected, we store the current time as the last packet receive time
     if last_packet_recv_time == 0:
@@ -173,13 +178,27 @@ def check_dos_behaviour(packet_source_address):
         is very fast,  it might be DOSing. In that case, the function will return True. If not, it returns False.
         """
 
+        # DOS Check
         if dos_stats[packet_source_address].packets_sent >= 30 and dos_stats[
             packet_source_address].time_since_own_packet * 2 <= sum_time_delta / len(packets_history):
             print(dos_stats[packet_source_address])
             print(f'Average time between packets {sum_time_delta / len(packets_history)}')
             print(f"{packet_source_address} is probably DOSing, blocking address...")
             return True
+
+        # DDOS Check
+        # We look for extreme changes in incoming data rate, regardless of the identity of the source machine
+        # If the random average time between packets is unreasonably higher, we might be experiencing a DDOS attack
+        if random_time_interval <= sum_time_delta / len(packets_history) * 2 and random_time_interval != 0:
+            print("DDOS pattern detected")
+            return True
+
+        # Every 3 packets (average) which test and store the current average of time between packets
+        if random.randint(1, 3) == 3:
+            random_time_interval = sum_time_delta / len(packets_history)
+
         return False
+
     except AttributeError as e:
         print(e)
         return False
